@@ -11,6 +11,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
+import org.w3c.dom.Document;
+import org.xml.sax.InputSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -34,6 +36,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import javax.xml.parsers.DocumentBuilderFactory;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -54,6 +57,16 @@ public class S3HttpUploader {
     private final Clock clock;
     private final ObservationRegistry observationRegistry;
     private final MeterRegistry meterRegistry;
+    private final DistributionSummary putBytesFixed;
+    private final DistributionSummary putBytesMultipart;
+    private final Counter putRequestsFixedSuccess;
+    private final Counter putRequestsFixedError;
+    private final Counter putRequestsMultipartSuccess;
+    private final Counter putRequestsMultipartError;
+    private final Timer putDurationFixedSuccess;
+    private final Timer putDurationFixedError;
+    private final Timer putDurationMultipartSuccess;
+    private final Timer putDurationMultipartError;
 
     @Autowired
     public S3HttpUploader(
@@ -74,6 +87,24 @@ public class S3HttpUploader {
         this.clock = clock;
         this.observationRegistry = observationRegistry;
         this.meterRegistry = meterRegistry;
+        this.putBytesFixed = DistributionSummary.builder("blobstream.s3.put.bytes")
+                .baseUnit("bytes")
+                .tag("mode", "fixed")
+                .tag("content_type", "application/octet-stream")
+                .register(meterRegistry);
+        this.putBytesMultipart = DistributionSummary.builder("blobstream.s3.put.bytes")
+                .baseUnit("bytes")
+                .tag("mode", "multipart")
+                .tag("content_type", "application/octet-stream")
+                .register(meterRegistry);
+        this.putRequestsFixedSuccess = Counter.builder("blobstream.s3.put.requests").tag("mode", "fixed").tag("result", "success").register(meterRegistry);
+        this.putRequestsFixedError = Counter.builder("blobstream.s3.put.requests").tag("mode", "fixed").tag("result", "error").register(meterRegistry);
+        this.putRequestsMultipartSuccess = Counter.builder("blobstream.s3.put.requests").tag("mode", "multipart").tag("result", "success").register(meterRegistry);
+        this.putRequestsMultipartError = Counter.builder("blobstream.s3.put.requests").tag("mode", "multipart").tag("result", "error").register(meterRegistry);
+        this.putDurationFixedSuccess = Timer.builder("blobstream.s3.put.duration").tag("mode", "fixed").tag("result", "success").register(meterRegistry);
+        this.putDurationFixedError = Timer.builder("blobstream.s3.put.duration").tag("mode", "fixed").tag("result", "error").register(meterRegistry);
+        this.putDurationMultipartSuccess = Timer.builder("blobstream.s3.put.duration").tag("mode", "multipart").tag("result", "success").register(meterRegistry);
+        this.putDurationMultipartError = Timer.builder("blobstream.s3.put.duration").tag("mode", "multipart").tag("result", "error").register(meterRegistry);
     }
 
     public int upload(String objectKey, String contentType, long contentLength, InputStream data) {
@@ -83,7 +114,7 @@ public class S3HttpUploader {
                 .lowCardinalityKeyValue("mode", "fixed")
                 .lowCardinalityKeyValue("request", "put_object")
                 .lowCardinalityKeyValue("target", "s3");
-        Timer.Sample timerSample = Timer.start(meterRegistry);
+        Timer.Sample timerSample = Timer.start();
         String result = "success";
         observation.start();
         try (Observation.Scope scope = observation.openScope()) {
@@ -106,21 +137,12 @@ public class S3HttpUploader {
         } catch (IOException ex) {
             result = "error";
             observation.error(ex);
-            throw new IllegalStateException("S3 upload failed.", ex);
+            throw new S3UploadException("S3 upload failed.", ex);
         } finally {
             observation.lowCardinalityKeyValue("result", result);
             observation.stop();
-            Counter.builder("blobstream.s3.put.requests")
-                    .tag("mode", "fixed")
-                    .tag("result", result)
-                    .register(meterRegistry)
-                    .increment();
-            timerSample.stop(
-                    Timer.builder("blobstream.s3.put.duration")
-                            .tag("mode", "fixed")
-                            .tag("result", result)
-                            .register(meterRegistry)
-            );
+            ("success".equals(result) ? putRequestsFixedSuccess : putRequestsFixedError).increment();
+            timerSample.stop("success".equals(result) ? putDurationFixedSuccess : putDurationFixedError);
         }
     }
 
@@ -148,14 +170,20 @@ public class S3HttpUploader {
             }
 
             if (uploadedParts.isEmpty()) {
-                return upload(objectKey, contentType, 0, InputStream.nullInputStream());
+                uploadedParts.add(uploadPart(
+                        objectKey,
+                        multipartUpload.uploadId(),
+                        nextPartNumber,
+                        new byte[0],
+                        0
+                ));
             }
 
             int statusCode = completeMultipartUpload(objectKey, multipartUpload.uploadId(), uploadedParts);
             completed = true;
             return statusCode;
         } catch (IOException ex) {
-            throw new IllegalStateException("S3 multipart upload failed.", ex);
+            throw new S3UploadException("S3 multipart upload failed.", ex);
         } finally {
             if (!completed) {
                 try {
@@ -186,7 +214,7 @@ public class S3HttpUploader {
             String uploadId = requiredXmlValue(response.body(), "UploadId");
             return new MultipartUpload(objectKey, uploadId);
         } catch (IOException ex) {
-            throw new IllegalStateException("Failed to start S3 multipart upload.", ex);
+            throw new S3UploadException("Failed to start S3 multipart upload.", ex);
         }
     }
 
@@ -197,14 +225,14 @@ public class S3HttpUploader {
                 .lowCardinalityKeyValue("mode", "multipart")
                 .lowCardinalityKeyValue("request", "upload_part")
                 .lowCardinalityKeyValue("target", "s3");
-        Timer.Sample timerSample = Timer.start(meterRegistry);
+        Timer.Sample timerSample = Timer.start();
         String result = "success";
         observation.start();
         try (Observation.Scope scope = observation.openScope()) {
             S3Response response = uploadPartWithRetries(objectKey, uploadId, partNumber, bytes, length);
             String eTag = response.header("ETag");
             if (eTag == null || eTag.isBlank()) {
-                throw new IllegalStateException("S3 multipart upload part response did not include an ETag.");
+                throw new S3UploadException("S3 multipart upload part response did not include an ETag.", new IllegalStateException("Missing ETag"));
             }
             recordSuccessMetrics(length, "multipart", "application/octet-stream");
             return new UploadedPart(partNumber, eTag, length);
@@ -215,21 +243,12 @@ public class S3HttpUploader {
         } catch (IOException ex) {
             result = "error";
             observation.error(ex);
-            throw new IllegalStateException("S3 multipart part upload failed.", ex);
+            throw new S3UploadException("S3 multipart part upload failed.", ex);
         } finally {
             observation.lowCardinalityKeyValue("result", result);
             observation.stop();
-            Counter.builder("blobstream.s3.put.requests")
-                    .tag("mode", "multipart")
-                    .tag("result", result)
-                    .register(meterRegistry)
-                    .increment();
-            timerSample.stop(
-                    Timer.builder("blobstream.s3.put.duration")
-                            .tag("mode", "multipart")
-                            .tag("result", result)
-                            .register(meterRegistry)
-            );
+            ("success".equals(result) ? putRequestsMultipartSuccess : putRequestsMultipartError).increment();
+            timerSample.stop("success".equals(result) ? putDurationMultipartSuccess : putDurationMultipartError);
         }
     }
 
@@ -306,7 +325,7 @@ public class S3HttpUploader {
             );
             return response.statusCode();
         } catch (IOException ex) {
-            throw new IllegalStateException("Failed to complete S3 multipart upload.", ex);
+            throw new S3UploadException("Failed to complete S3 multipart upload.", ex);
         }
     }
 
@@ -322,7 +341,7 @@ public class S3HttpUploader {
                     false
             );
         } catch (IOException ex) {
-            throw new IllegalStateException("Failed to abort S3 multipart upload.", ex);
+            throw new S3UploadException("Failed to abort S3 multipart upload.", ex);
         }
     }
 
@@ -430,6 +449,14 @@ public class S3HttpUploader {
     }
 
     private void recordSuccessMetrics(long bytesTransferred, String mode, String contentType) {
+        if ("multipart".equals(mode)) {
+            putBytesMultipart.record(bytesTransferred);
+            return;
+        }
+        if ("application/octet-stream".equals(normalizeContentType(contentType))) {
+            putBytesFixed.record(bytesTransferred);
+            return;
+        }
         DistributionSummary.builder("blobstream.s3.put.bytes")
                 .baseUnit("bytes")
                 .tag("mode", mode)
@@ -573,14 +600,24 @@ public class S3HttpUploader {
     }
 
     private String requiredXmlValue(String xml, String tagName) {
-        String openTag = "<" + tagName + ">";
-        String closeTag = "</" + tagName + ">";
-        int start = xml.indexOf(openTag);
-        int end = xml.indexOf(closeTag);
-        if (start < 0 || end < 0 || end <= start) {
-            throw new IllegalStateException("S3 response did not contain the expected <" + tagName + "> value: " + xml);
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(false);
+            Document document = factory.newDocumentBuilder().parse(new InputSource(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))));
+            var nodes = document.getElementsByTagName(tagName);
+            if (nodes.getLength() == 0) {
+                throw new S3UploadException("S3 response did not contain the expected <" + tagName + "> value.", new IllegalStateException("Missing XML tag"));
+            }
+            String value = nodes.item(0).getTextContent();
+            if (value == null || value.isBlank()) {
+                throw new S3UploadException("S3 response contained an empty <" + tagName + "> value.", new IllegalStateException("Empty XML tag"));
+            }
+            return value;
+        } catch (S3UploadException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new S3UploadException("Failed to parse S3 XML response.", ex);
         }
-        return xml.substring(start + openTag.length(), end);
     }
 
     private String completeMultipartRequest(List<UploadedPart> parts) {

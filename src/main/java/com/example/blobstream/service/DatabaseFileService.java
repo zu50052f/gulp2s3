@@ -39,7 +39,16 @@ public class DatabaseFileService {
     private final TransactionTemplate transactionTemplate;
     private final S3HttpUploader s3HttpUploader;
     private final ObservationRegistry observationRegistry;
-    private final MeterRegistry meterRegistry;
+    private final Counter storeRequestsSuccess;
+    private final Counter storeRequestsError;
+    private final Timer storeDurationSuccess;
+    private final Timer storeDurationError;
+    private final DistributionSummary storeBytes;
+    private final Counter transferRequestsSuccess;
+    private final Counter transferRequestsError;
+    private final Timer transferDurationSuccess;
+    private final Timer transferDurationError;
+    private final DistributionSummary transferBytes;
 
     public DatabaseFileService(
             DataSource dataSource,
@@ -54,7 +63,36 @@ public class DatabaseFileService {
         this.transactionTemplate = transactionTemplate;
         this.s3HttpUploader = s3HttpUploader;
         this.observationRegistry = observationRegistry;
-        this.meterRegistry = meterRegistry;
+        this.storeRequestsSuccess = Counter.builder("blobstream.file.store.requests")
+                .tag("result", "success")
+                .register(meterRegistry);
+        this.storeRequestsError = Counter.builder("blobstream.file.store.requests")
+                .tag("result", "error")
+                .register(meterRegistry);
+        this.storeDurationSuccess = Timer.builder("blobstream.file.store.duration")
+                .tag("result", "success")
+                .register(meterRegistry);
+        this.storeDurationError = Timer.builder("blobstream.file.store.duration")
+                .tag("result", "error")
+                .register(meterRegistry);
+        this.storeBytes = DistributionSummary.builder("blobstream.file.store.bytes")
+                .baseUnit("bytes")
+                .register(meterRegistry);
+        this.transferRequestsSuccess = Counter.builder("blobstream.file.transfer.requests")
+                .tag("result", "success")
+                .register(meterRegistry);
+        this.transferRequestsError = Counter.builder("blobstream.file.transfer.requests")
+                .tag("result", "error")
+                .register(meterRegistry);
+        this.transferDurationSuccess = Timer.builder("blobstream.file.transfer.duration")
+                .tag("result", "success")
+                .register(meterRegistry);
+        this.transferDurationError = Timer.builder("blobstream.file.transfer.duration")
+                .tag("result", "error")
+                .register(meterRegistry);
+        this.transferBytes = DistributionSummary.builder("blobstream.file.transfer.bytes")
+                .baseUnit("bytes")
+                .register(meterRegistry);
     }
 
     public StoredFile store(MultipartFile multipartFile, String requestedObjectKey) {
@@ -62,7 +100,7 @@ public class DatabaseFileService {
                 .contextualName("store-file-in-postgresql")
                 .lowCardinalityKeyValue("flow", "blob")
                 .lowCardinalityKeyValue("storage", "postgres-large-object");
-        Timer.Sample timerSample = Timer.start(meterRegistry);
+        Timer.Sample timerSample = Timer.start();
         String result = "success";
         observation.start();
         try (Observation.Scope scope = observation.openScope()) {
@@ -70,10 +108,7 @@ public class DatabaseFileService {
                     transactionTemplate.execute(status -> storeInsideTransaction(multipartFile, requestedObjectKey)),
                     "Failed to store the multipart file in PostgreSQL."
             );
-            DistributionSummary.builder("blobstream.file.store.bytes")
-                    .baseUnit("bytes")
-                    .register(meterRegistry)
-                    .record(storedFile.contentLength());
+            storeBytes.record(storedFile.contentLength());
             return storedFile;
         } catch (RuntimeException ex) {
             result = "error";
@@ -82,15 +117,8 @@ public class DatabaseFileService {
         } finally {
             observation.lowCardinalityKeyValue("result", result);
             observation.stop();
-            Counter.builder("blobstream.file.store.requests")
-                    .tag("result", result)
-                    .register(meterRegistry)
-                    .increment();
-            timerSample.stop(
-                    Timer.builder("blobstream.file.store.duration")
-                            .tag("result", result)
-                            .register(meterRegistry)
-            );
+            ("success".equals(result) ? storeRequestsSuccess : storeRequestsError).increment();
+            timerSample.stop("success".equals(result) ? storeDurationSuccess : storeDurationError);
         }
     }
 
@@ -103,7 +131,7 @@ public class DatabaseFileService {
                 .contextualName("blob-transfer")
                 .lowCardinalityKeyValue("flow", "blob")
                 .lowCardinalityKeyValue("target", "s3");
-        Timer.Sample timerSample = Timer.start(meterRegistry);
+        Timer.Sample timerSample = Timer.start();
         String result = "success";
         observation.start();
         try (Observation.Scope scope = observation.openScope()) {
@@ -121,15 +149,8 @@ public class DatabaseFileService {
         } finally {
             observation.lowCardinalityKeyValue("result", result);
             observation.stop();
-            Counter.builder("blobstream.file.transfer.requests")
-                    .tag("result", result)
-                    .register(meterRegistry)
-                    .increment();
-            timerSample.stop(
-                    Timer.builder("blobstream.file.transfer.duration")
-                            .tag("result", result)
-                            .register(meterRegistry)
-            );
+            ("success".equals(result) ? transferRequestsSuccess : transferRequestsError).increment();
+            timerSample.stop("success".equals(result) ? transferDurationSuccess : transferDurationError);
         }
     }
 
@@ -171,9 +192,9 @@ public class DatabaseFileService {
                     ex
             );
         } catch (IOException | SQLException ex) {
-            throw new IllegalStateException("Failed to write the file into PostgreSQL.", ex);
+            throw new DatabaseStorageException("Failed to write the file into PostgreSQL.", ex);
         } catch (RuntimeException ex) {
-            throw new IllegalStateException("Failed to persist file metadata in PostgreSQL.", ex);
+            throw new DatabaseStorageException("Failed to persist file metadata in PostgreSQL.", ex);
         } finally {
             DataSourceUtils.releaseConnection(connection, dataSource);
         }
@@ -209,13 +230,10 @@ public class DatabaseFileService {
                 largeObject.close();
             }
 
-            DistributionSummary.builder("blobstream.file.transfer.bytes")
-                    .baseUnit("bytes")
-                    .register(meterRegistry)
-                    .record(storedFile.contentLength());
+            transferBytes.record(storedFile.contentLength());
             return new TransferResponse(id, s3HttpUploader.bucket(), storedFile.objectKey(), statusCode);
         } catch (IOException | SQLException ex) {
-            throw new IllegalStateException("Failed to stream the large object from PostgreSQL.", ex);
+            throw new DatabaseStorageException("Failed to stream the large object from PostgreSQL.", ex);
         } finally {
             DataSourceUtils.releaseConnection(connection, dataSource);
         }
