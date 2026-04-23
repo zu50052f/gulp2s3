@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: blob-stream-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/blobstream}
+    username: ${SPRING_DATASOURCE_USERNAME:blobstream}
+    password: ${SPRING_DATASOURCE_PASSWORD:blobstream}
+  servlet:
+    multipart:
+      max-file-size: 512MB
+      max-request-size: 512MB
+  sql:
+    init:
+      mode: always
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: ${MANAGEMENT_TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      endpoint: ${MANAGEMENT_OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  opentelemetry:
+    resource-attributes:
+      service.namespace: blobstream
+      deployment.environment: ${DEPLOYMENT_ENVIRONMENT:local}
+
+app:
+  s3:
+    endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}
+    region: ${APP_S3_REGION:us-east-1}
+    bucket: ${APP_S3_BUCKET:blob-files}
+    access-key: ${APP_S3_ACCESS_KEY:minioadmin}
+    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+    connect-timeout: 10s
+    read-timeout: 10m
+    multipart-part-size-bytes: ${APP_S3_MULTIPART_PART_SIZE_BYTES:8388608}
+    multipart-retry-max-attempts: ${APP_S3_MULTIPART_RETRY_MAX_ATTEMPTS:4}
+    multipart-retry-base-delay: ${APP_S3_MULTIPART_RETRY_BASE_DELAY:1s}
+    delete-existing-object-before-write: ${APP_S3_DELETE_EXISTING_OBJECT_BEFORE_WRITE:false}
+  report:
+    fetch-size: ${APP_REPORT_FETCH_SIZE:1000}
+    pipe-buffer-bytes: ${APP_REPORT_PIPE_BUFFER_BYTES:65536}
+    multipart-part-size-bytes: ${APP_REPORT_MULTIPART_PART_SIZE_BYTES:8388608}
+    allowed-tables:
+      - stored_file
+      - report_source_row

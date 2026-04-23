@@ -1,0 +1,232 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: blobstream
+      POSTGRES_USER: blobstream
+      POSTGRES_PASSWORD: blobstream
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blobstream -d blobstream"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  create-bucket:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb --ignore-existing local/blob-files;
+      "
+
+  cleanup-load-objects:
+    image: minio/mc:latest
+    profiles:
+      - load
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      REPORT_OBJECT_PREFIX: ${REPORT_OBJECT_PREFIX:-reports/load-test}
+      REPORT_ZIP_OBJECT_PREFIX: ${REPORT_ZIP_OBJECT_PREFIX:-reports/load-test}
+      BLOB_OBJECT_PREFIX: ${BLOB_OBJECT_PREFIX:-blob/load-test}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc rm --recursive --force local/blob-files/$$REPORT_OBJECT_PREFIX >/dev/null 2>&1 || true;
+      mc rm --recursive --force local/blob-files/$$REPORT_ZIP_OBJECT_PREFIX >/dev/null 2>&1 || true;
+      mc rm --recursive --force local/blob-files/$$BLOB_OBJECT_PREFIX >/dev/null 2>&1 || true;
+      mc rm --recursive --force --incomplete local/blob-files/$$REPORT_OBJECT_PREFIX >/dev/null 2>&1 || true;
+      mc rm --recursive --force --incomplete local/blob-files/$$REPORT_ZIP_OBJECT_PREFIX >/dev/null 2>&1 || true;
+      mc rm --recursive --force --incomplete local/blob-files/$$BLOB_OBJECT_PREFIX >/dev/null 2>&1 || true;
+      "
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.7.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+      - jaeger
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+
+  seed-report-data:
+    image: postgres:16-alpine
+    profiles:
+      - load
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: blobstream
+      PGUSER: blobstream
+      PGPASSWORD: blobstream
+      REPORT_ROW_TARGET: ${REPORT_ROW_TARGET:-513500}
+      REPORT_PAYLOAD_BYTES: ${REPORT_PAYLOAD_BYTES:-4096}
+      POSTGRES_WAIT_TIMEOUT_SECONDS: ${POSTGRES_WAIT_TIMEOUT_SECONDS:-120}
+    volumes:
+      - ./observability/load:/scripts:ro
+    entrypoint:
+      - /bin/sh
+      - /scripts/seed-report-source.sh
+
+  seed-blob-file:
+    profiles:
+      - load
+    build:
+      context: .
+    depends_on:
+      app:
+        condition: service_healthy
+    command:
+      - --app.seed-blob.enabled=true
+      - --app.seed-blob.exit-after-seed=true
+      - --app.seed-blob.object-key=blob/load-test/${LOADTEST_RUN_ID:-current}-seed-file.bin
+      - --app.seed-blob.file-name=${LOADTEST_RUN_ID:-current}-seed-file.bin
+      - --app.seed-blob.content-type=application/octet-stream
+      - --app.seed-blob.size-bytes=${BLOB_SEED_SIZE_BYTES:-2147483648}
+      - --app.seed-blob.chunk-size-bytes=${BLOB_SEED_CHUNK_SIZE_BYTES:-8388608}
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/blobstream
+      SPRING_DATASOURCE_USERNAME: blobstream
+      SPRING_DATASOURCE_PASSWORD: blobstream
+      JAVA_TOOL_OPTIONS: -Xms64m -Xmx128m -XX:+ExitOnOutOfMemoryError
+
+  loadtest:
+    image: grafana/k6:latest
+    profiles:
+      - load
+    depends_on:
+      cleanup-load-objects:
+        condition: service_completed_successfully
+      seed-report-data:
+        condition: service_completed_successfully
+      seed-blob-file:
+        condition: service_completed_successfully
+      grafana:
+        condition: service_started
+      app:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8080
+      LOADTEST_RUN_ID: ${LOADTEST_RUN_ID:-current}
+      REPORT_TABLE: report_source_row
+      REPORT_OBJECT_PREFIX: reports/load-test
+      REPORT_ZIP_OBJECT_PREFIX: reports/load-test
+      BLOB_OBJECT_PREFIX: blob/load-test
+      BLOB_SETUP_MODE: ${BLOB_SETUP_MODE:-reuse-existing}
+      BLOB_SEEDED_OBJECT_KEY: ${BLOB_SEEDED_OBJECT_KEY:-blob/load-test/${LOADTEST_RUN_ID:-current}-seed-file.bin}
+      REPORT_VUS: ${REPORT_VUS:-1}
+      REPORT_DURATION: ${REPORT_DURATION:-5m}
+      REPORT_PAUSE_SECONDS: ${REPORT_PAUSE_SECONDS:-5}
+      REPORT_TIMEOUT: ${REPORT_TIMEOUT:-20m}
+      REPORT_REUSE_KEYS: ${REPORT_REUSE_KEYS:-true}
+      REPORT_ZIP_VUS: ${REPORT_ZIP_VUS:-1}
+      REPORT_ZIP_DURATION: ${REPORT_ZIP_DURATION:-5m}
+      REPORT_ZIP_START_TIME: ${REPORT_ZIP_START_TIME:-30s}
+      REPORT_ZIP_PAUSE_SECONDS: ${REPORT_ZIP_PAUSE_SECONDS:-5}
+      REPORT_ZIP_TIMEOUT: ${REPORT_ZIP_TIMEOUT:-20m}
+      BLOB_VUS: ${BLOB_VUS:-1}
+      BLOB_DURATION: ${BLOB_DURATION:-5m}
+      BLOB_PAUSE_SECONDS: ${BLOB_PAUSE_SECONDS:-5}
+      BLOB_TIMEOUT: ${BLOB_TIMEOUT:-20m}
+      BLOB_START_TIME: ${BLOB_START_TIME:-60s}
+      REPORT_JITTER_SECONDS: ${REPORT_JITTER_SECONDS:-2}
+      REPORT_ZIP_JITTER_SECONDS: ${REPORT_ZIP_JITTER_SECONDS:-2}
+      BLOB_JITTER_SECONDS: ${BLOB_JITTER_SECONDS:-2}
+      REPORT_INITIAL_JITTER_SECONDS: ${REPORT_INITIAL_JITTER_SECONDS:-3}
+      REPORT_ZIP_INITIAL_JITTER_SECONDS: ${REPORT_ZIP_INITIAL_JITTER_SECONDS:-3}
+      BLOB_INITIAL_JITTER_SECONDS: ${BLOB_INITIAL_JITTER_SECONDS:-3}
+      FILE_SIZE_BYTES: ${FILE_SIZE_BYTES:-2097152}
+    volumes:
+      - ./observability/load:/scripts:ro
+    command:
+      - run
+      - /scripts/loadtest.js
+
+  app:
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/blobstream
+      SPRING_DATASOURCE_USERNAME: blobstream
+      SPRING_DATASOURCE_PASSWORD: blobstream
+      APP_S3_ENDPOINT: http://minio:9000
+      APP_S3_REGION: us-east-1
+      APP_S3_BUCKET: blob-files
+      APP_S3_ACCESS_KEY: minioadmin
+      APP_S3_SECRET_KEY: minioadmin
+      APP_S3_MULTIPART_PART_SIZE_BYTES: 8388608
+      APP_S3_MULTIPART_RETRY_MAX_ATTEMPTS: 4
+      APP_S3_MULTIPART_RETRY_BASE_DELAY: 1s
+      APP_S3_DELETE_EXISTING_OBJECT_BEFORE_WRITE: "true"
+      APP_REPORT_MULTIPART_PART_SIZE_BYTES: 8388608
+      MANAGEMENT_TRACING_SAMPLING_PROBABILITY: 1.0
+      MANAGEMENT_OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_SERVICE_NAME: blob-stream-service
+      OTEL_RESOURCE_ATTRIBUTES: service.version=0.0.1-SNAPSHOT,deployment.environment=local
+      JAVA_TOOL_OPTIONS: -Xms64m -Xmx128m -XX:+ExitOnOutOfMemoryError
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres-data:
+  minio-data:
