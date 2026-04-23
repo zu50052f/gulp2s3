@@ -49,6 +49,10 @@ public class ReportStreamingService {
     private final S3HttpUploader s3HttpUploader;
     private final ObservationRegistry observationRegistry;
     private final MeterRegistry meterRegistry;
+    private final Counter transferRequestsSuccess;
+    private final Counter transferRequestsError;
+    private final Timer transferDurationSuccess;
+    private final Timer transferDurationError;
 
     public ReportStreamingService(
             DataSource dataSource,
@@ -62,6 +66,18 @@ public class ReportStreamingService {
         this.s3HttpUploader = s3HttpUploader;
         this.observationRegistry = observationRegistry;
         this.meterRegistry = meterRegistry;
+        this.transferRequestsSuccess = Counter.builder("blobstream.report.transfer.requests")
+                .tag("result", "success")
+                .register(meterRegistry);
+        this.transferRequestsError = Counter.builder("blobstream.report.transfer.requests")
+                .tag("result", "error")
+                .register(meterRegistry);
+        this.transferDurationSuccess = Timer.builder("blobstream.report.transfer.duration")
+                .tag("result", "success")
+                .register(meterRegistry);
+        this.transferDurationError = Timer.builder("blobstream.report.transfer.duration")
+                .tag("result", "error")
+                .register(meterRegistry);
     }
 
     public ReportTransferResponse streamTableAsCsvToS3(String tableName, String requestedObjectKey, boolean zip) {
@@ -75,7 +91,7 @@ public class ReportStreamingService {
                 .lowCardinalityKeyValue("format", format)
                 .lowCardinalityKeyValue("table", normalizedTable)
                 .lowCardinalityKeyValue("target", "s3");
-        Timer.Sample timerSample = Timer.start(meterRegistry);
+        Timer.Sample timerSample = Timer.start();
         String result = "success";
         observation.start();
         try (Observation.Scope scope = observation.openScope()) {
@@ -102,19 +118,8 @@ public class ReportStreamingService {
         } finally {
             observation.lowCardinalityKeyValue("result", result);
             observation.stop();
-            Counter.builder("blobstream.report.transfer.requests")
-                    .tag("format", format)
-                    .tag("table", normalizedTable)
-                    .tag("result", result)
-                    .register(meterRegistry)
-                    .increment();
-            timerSample.stop(
-                    Timer.builder("blobstream.report.transfer.duration")
-                            .tag("format", format)
-                            .tag("table", normalizedTable)
-                            .tag("result", result)
-                            .register(meterRegistry)
-            );
+            ("success".equals(result) ? transferRequestsSuccess : transferRequestsError).increment();
+            timerSample.stop("success".equals(result) ? transferDurationSuccess : transferDurationError);
         }
     }
 
@@ -164,7 +169,7 @@ public class ReportStreamingService {
                     statusCode
             );
         } catch (IOException ex) {
-            throw new IllegalStateException("Failed to write the CSV report for table " + normalizedTable + ".", ex);
+            throw new ReportStreamingException("Failed to write the CSV report for table " + normalizedTable + ".", ex);
         } finally {
             try {
                 writer.close();
@@ -214,7 +219,7 @@ public class ReportStreamingService {
 
             connection.commit();
         } catch (SQLException | IOException ex) {
-            throw new IllegalStateException("Failed to stream table " + tableName + " as CSV.", ex);
+            throw new ReportStreamingException("Failed to stream table " + tableName + " as CSV.", ex);
         }
     }
 
